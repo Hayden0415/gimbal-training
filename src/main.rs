@@ -10,8 +10,8 @@ use embassy_executor::Spawner;
 use embassy_stm32::can::Frame;
 use embassy_time::{Duration, Instant, Ticker};
 
-// GM6020 current-mode group command for motor IDs 1 to 4.
-const MOTOR_COMMAND_ID: u16 = 0x1FE;
+// This rig uses GM6020 voltage commands for motor IDs 1 to 4.
+const MOTOR_COMMAND_ID: u16 = 0x1FF;
 // Ticks without remote input before it counts as lost.
 const REMOTE_SILENT_TICKS: u16 = 100;
 const TICK: Duration = Duration::from_millis(1);
@@ -20,7 +20,7 @@ const TICK: Duration = Duration::from_millis(1);
 /// motor acknowledges frames.
 pub static TX_FAILED: AtomicU32 = AtomicU32::new(0);
 
-/// Feedback and current command for one motor.
+/// Feedback and voltage command for one motor.
 #[derive(Default)]
 pub struct Motor {
     /// Single-turn motor shaft angle in rad; turns are not counted.
@@ -28,15 +28,15 @@ pub struct Motor {
     pub speed_rpm: f32,
     /// Feedback current as sent on the wire. The motor manual gives no scale to amperes.
     pub current_raw: i16,
-    /// Current command in A, encoded by `Control::transmit`.
-    pub command_current_a: f32,
+    /// Voltage command counts, not volts; protocol range +/-25000.
+    pub command_voltage_raw: f32,
 }
 
 impl Motor {
-    /// Clear the current command in RAM. The motor receives zero when
+    /// Clear the voltage command in RAM. The motor receives zero when
     /// `Control::transmit` next runs, within 1 ms.
     pub fn disable(&mut self) {
-        self.command_current_a = 0.0;
+        self.command_voltage_raw = 0.0;
     }
 
     pub fn read(&mut self, _data: &[u8; 8]) {
@@ -57,7 +57,7 @@ impl Pid {
     }
 
     /// `target` and `measured` share a unit, set by the caller. The position loop takes rad
-    /// and returns rpm; the speed loop takes rpm and returns A. `dt_s` is in seconds.
+    /// and returns rpm; the speed loop takes rpm and returns voltage counts. `dt_s` is in seconds.
     /// If a position loop returns rad/s, convert it to rpm before passing it to the speed loop.
     pub fn calculate(&mut self, _target: f32, _measured: f32, _dt_s: f32) -> f32 {
         // TODO: compute the PID with dt_s, and limit the integral and output.
@@ -90,7 +90,7 @@ pub struct Axis {
     pub target_rpm: f32,
     /// Position loop: rad in, rpm out.
     pub position_pid: Pid,
-    /// Speed loop: rpm in, A out.
+    /// Speed loop: rpm in, voltage counts out.
     pub speed_pid: Pid,
 }
 
@@ -119,19 +119,19 @@ impl Default for Control {
 }
 
 impl Control {
-    /// Clear both motors' current commands in RAM.
+    /// Clear both motors' voltage commands in RAM.
     pub fn disable_all(&mut self) {
         self.yaw.motor.disable();
         self.pitch.motor.disable();
     }
 
     /// Runs every 1 ms: read the remote and motor feedback, update the state, then
-    /// compute and send the outputs. Missing remote input forces `Waiting`.
+    /// compute and send the outputs. Missing remote input stops output; a latched Error is preserved.
     pub fn tick(&mut self, can: &mut Can1) {
         self.read_remote();
         self.read_feedback(can);
         self.update_mode();
-        if self.remote.is_none() {
+        if self.remote.is_none() && self.state != State::Error {
             self.state = State::Waiting;
         }
         self.update();
@@ -139,7 +139,7 @@ impl Control {
     }
 
     /// Take the latest input published by the remote task. After an invalid frame, or
-    /// `REMOTE_SILENT_TICKS` ticks without one, clear the motor commands and return to `Waiting`.
+    /// `REMOTE_SILENT_TICKS` ticks without one, clear the commands; return to Waiting unless already in Error.
     pub fn read_remote(&mut self) {
         self.remote_silent_ticks = self.remote_silent_ticks.saturating_add(1);
         if let Some(remote) = dm_mc02::REMOTE.try_take() {
@@ -153,7 +153,9 @@ impl Control {
         }
         if self.remote.is_none() {
             self.disable_all();
-            self.state = State::Waiting;
+            if self.state != State::Error {
+                self.state = State::Waiting;
+            }
         }
     }
 
@@ -183,15 +185,16 @@ impl Control {
                 // TODO: enter Running once recentering settles; stop on a timeout or fault.
             }
             State::Running => {
-                // TODO: handle disable, feedback timeouts and control faults.
+                // TODO: handle disable/feedback loss; stall or sustained high-frequency oscillation enters Error.
             }
             State::Error => {
-                // TODO: keep zero output until your manual recovery condition.
+                // TODO: keep zero output until a new remote recovery gesture; hold current angles,
+                // clear PID history and detection counters, then return to Running.
             }
         }
     }
 
-    /// Set targets for the current state, run each axis's PIDs and write the current commands.
+    /// Set targets for the current state, run each axis's PIDs and write the voltage commands.
     // TODO: limited recentering in Prepare, remote cascade control in Running, and
     // `disable_all` in Waiting and Error. Each tick is 0.001 s.
     pub fn update(&mut self) {}
@@ -201,7 +204,8 @@ impl Control {
     /// counts it in `TX_FAILED`.
     pub fn transmit(&mut self, can: &mut Can1) {
         let data = [0u8; 8];
-        // TODO: limit and convert each axis's `command_current_a`, and write it into the
+        // TODO: clamp each voltage count output within the bench limit (protocol +/-25000),
+        // encode signed i16 big-endian and write it into the
         // bytes for its motor ID as the manual describes. Other motor IDs stay zero.
         let frame = Frame::new_standard(MOTOR_COMMAND_ID, &data).unwrap();
         if can.writer().try_write(frame).is_err() {

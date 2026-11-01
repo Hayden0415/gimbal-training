@@ -94,14 +94,14 @@ self.transmit(can);      // 把计算结果真正发给电机
 
 ### 4. 电机变量分别是什么？
 
-模板里的 `Motor` 保存一个电机的反馈和电流指令：
+模板里的 `Motor` 保存一个电机的反馈和电压指令：
 
 ```rust
 pub struct Motor {
     pub angle_rad: f32,
     pub speed_rpm: f32,
     pub current_raw: i16,
-    pub command_current_a: f32,
+    pub command_voltage_raw: f32,
 }
 ```
 
@@ -110,14 +110,14 @@ pub struct Motor {
 | `angle_rad` | 当前电机轴角度 | rad；模板尚未实现多圈累计 |
 | `speed_rpm` | 当前电机轴转速 | rpm |
 | `current_raw` | 反馈电流 | 协议原始值；手册未给出换算到 A 的比例 |
-| `command_current_a` | 控制器计算的电流指令 | A；发送前还要换算成协议数值 |
+| `command_voltage_raw` | 控制器计算的电压指令 | 协议原始值，不是 V 或 A；限幅后编码 |
 
 例如，在已经取得有效电机对象后，可以这样访问字段：
 
 ```rust
 let angle = motor.angle_rad;
 let speed = motor.speed_rpm;
-motor.command_current_a = 0.0;
+motor.command_voltage_raw = 0.0;
 ```
 
 两轴放在 `Control` 的 `yaw`、`pitch` 中，类型为 `Axis`，各自包含电机、目标和 PID：
@@ -138,32 +138,32 @@ pub struct Axis {
 | `target_angle_rad` | 希望达到的角度 | rad；是位置环目标 |
 | `target_rpm` | 希望达到的电机轴转速 | rpm；是速度环目标，由位置环输出给出 |
 | `position_pid` | 位置环 | 输入 rad，输出 rpm |
-| `speed_pid` | 速度环 | 输入 rpm，输出 A |
+| `speed_pid` | 速度环 | 输入 rpm，输出电压原始值 |
 
 ### 5. 电机指令怎样发出去？
 
 协议部分有两处需要你补全：
 
 - `Motor::read(&mut self, data: &[u8; 8])`：把一帧八字节反馈转换成角度、速度和电流。反馈帧应该怎样对应到 yaw 或 pitch，请查手册并补全 `Control::read_feedback`。
-- `Control::transmit` 中的 `data`：把两轴的 `command_current_a` 限幅、换算后写入各自电机 ID 对应的字节，其他字节保持为零。
+- `Control::transmit` 中的 `data`：把两轴的 `command_voltage_raw` 限幅、换算后写入各自电机 ID 对应的字节，其他字节保持为零。
 
-模板用 `MOTOR_COMMAND_ID = 0x1FE` 发送电流模式组指令。`Control::transmit` 每个周期都会发送一帧，模板中 `data` 全为零，所以未补全前电机只会收到零电流。发送队列满时（例如总线上没有电机应答）这一帧会被丢弃，并计入全局计数 `TX_FAILED`，不会 panic。接收到的 CAN 总线错误交给 `dm_mc02::log_can_error`，计入 `CAN_ERRORS`。
+**现场测试确认：目前教具使用 `0x1FF` 电压组指令能够驱动电机，使用 `0x1FE` 电流组指令没有产生运动。本作业统一使用 `MOTOR_COMMAND_ID = 0x1FF`。** 这针对当前教具配置，不表示所有 GM6020 都不能使用电流模式。输出为有符号电压原始值，手册范围 `−25000～25000`，调试先采用更小的输出限幅；不要沿用 A 为单位的参数，也不要乘 `16384 / 3` 编码。`Control::transmit` 每个周期都会发送一帧，模板中 `data` 全为零，所以未补全前电机只会收到零电压指令。发送队列满时（例如总线上没有电机应答）这一帧会被丢弃，并计入全局计数 `TX_FAILED`，不会 panic。接收到的 CAN 总线错误交给 `dm_mc02::log_can_error`，计入 `CAN_ERRORS`。
 
 已有停止接口：
 
 ```rust
-motor.disable();   // 清除这个电机的电流指令
+motor.disable();   // 清除这个电机的电压指令
 self.disable_all(); // 清除两轴电机的指令
 ```
 
-这两者只修改内存，**不会自己发送 CAN 帧**，要等 `Control::transmit` 在本周期末尾发送，所以停止依赖发送正常工作。你需要保证零电流被编码为协议零值。零电流也不等于主动刹车或保持原角度。
+这两者只修改内存，**不会自己发送 CAN 帧**，要等 `Control::transmit` 在本周期末尾发送，所以停止依赖发送正常工作。你需要保证零电压指令被编码为协议零值。零电压指令也不等于主动刹车或保持原角度。
 
 ### 6. 遥控器怎么用？
 
 **本次用左边同一根摇杆控制云台：左右控制 yaw，上下控制 pitch。** 右摇杆不控制这两轴。
 
 ```rust
-// 放在 Control 的方法中；先读取输入，不在这里直接写电流。
+// 放在 Control 的方法中；先读取输入，不在这里直接写电压输出。
 if let Some(remote) = self.remote {
     let yaw_input = remote.channels[2] as f32 / 660.0;
     let pitch_input = remote.channels[3] as f32 / 660.0;
@@ -200,7 +200,7 @@ if let Some(remote) = self.remote {
 
 不要只看到中位就反复启动。首次上电或遥控器重新连接后，应先下拨，再拨到中位，识别一次新的使能操作。故障退出还需要你设计的独立人工确认，不能只因拨杆一直在中位就恢复。
 
-接收不到有效输入达 100 个控制周期（约 100 ms），或接收任务报告无效帧／串口错误时，模板会清零指令并回到 `Waiting`。恢复信号后不能自动使能，启动必须识别为一次新的操作。当前模板还可能让断联覆盖 `Error`，因此故障原因／故障锁存不要只靠 `State::Error` 保存；未处理的故障不能因遥控器断开再接通而消失。
+接收不到有效输入达 100 个控制周期（约 100 ms），或接收任务报告无效帧／串口错误时，模板会清零指令，非故障状态回到 `Waiting`，`Error` 则保留。恢复信号后不能自动使能，启动必须识别为一次新的操作。已经进入 `Error` 时，断联只停止输出，保留 `Error`；重连后仍需人工恢复。
 
 ### 7. 需要自己查的两份手册
 
@@ -234,9 +234,9 @@ impl Pid {
 }
 ```
 
-上面是接口节选，不是完整实现。速度环输入为 rpm，输出为 A，每次调用的 `dt_s` 为 `0.001`。你需要添加增益、积分、历史数据和限制，并完成 `reset`、`calculate`。
+上面是接口节选，不是完整实现。速度环输入为 rpm，输出为电压原始值，每次调用的 `dt_s` 为 `0.001`。你需要添加增益、积分、历史数据和限制，并完成 `reset`、`calculate`。
 
-双环的连接为：`Axis::target_angle_rad` 交给 `position_pid`，它的输出写入 `target_rpm`，再交给 `speed_pid`，最后得到该轴电机的 `command_current_a`。`yaw`、`pitch` 各有一组 PID，历史状态互不影响。若位置环输出 rad/s，先换算成 rpm 再接速度环。
+双环的连接为：`Axis::target_angle_rad` 交给 `position_pid`，它的输出写入 `target_rpm`，再交给 `speed_pid`，最后得到该轴电机的 `command_voltage_raw`。`yaw`、`pitch` 各有一组 PID，历史状态互不影响。若位置环输出 rad/s，先换算成 rpm 再接速度环。
 
 ### 9. 状态机是什么？
 
@@ -256,17 +256,44 @@ pub enum State {
 | 状态 | 在等什么／做什么 |
 |---|---|
 | `Waiting` | 零输出。等待遥控输入有效、两轴反馈新鲜，再等一次新的使能操作 |
-| `Prepare` | 回正：限速限流地把两轴转到参考姿态，等两轴稳定后进入 `Running` |
+| `Prepare` | 回正：限速限输出地把两轴转到参考姿态，等两轴稳定后进入 `Running` |
 | `Running` | 遥控调试：左摇杆移动目标角度，两轴双环跟随 |
 | `Error` | 零输出，等待人工恢复 |
 
 初始状态为 `Waiting`。`update_mode` 中已经搭好 `match self.state` 的四个分支，分支内容还需要填写。
+
+### 10. 怎么观察下面的检查结果？
+
+Tuning Studio 的连接步骤见第五部分。展开 `Tasks → control_task → control` 后，按字段路径展开，例如 `yaw → motor → speed_rpm`。下文写 `yaw.motor.speed_rpm` 就是这里的值，点击数值旁的方块可加入曲线。`state` 查看枚举名称。
+
+模板默认只打印启动日志，不会自动打印下面的数据。请自行添加限频 RTT 日志：在 `control_task` 的循环外声明 `let mut log_ticks = 0u16;`，在 `control.tick(&mut can);` 后添加：
+
+```rust
+log_ticks += 1;
+if log_ticks >= 200 {
+    log_ticks = 0;
+    rtt_target::rprintln!(
+        "state={:?} yaw: angle={:.3} target={:.3} rpm={:.1} target_rpm={:.1} out={:.0}",
+        control.state,
+        control.yaw.motor.angle_rad,
+        control.yaw.target_angle_rad,
+        control.yaw.motor.speed_rpm,
+        control.yaw.target_rpm,
+        control.yaw.motor.command_voltage_raw,
+    );
+    // pitch 用同样的字段打印，把 control.yaw 换成 control.pitch。
+}
+```
+
+运行 `cargo run --release --locked` 后在终端看日志，这段示例约每 `200 ms` 打印一次。状态切换和故障原因可在发生处额外打印一次，避免漏看瞬间。需要观察的 PID 内部量、回正计时、堵转计时和振荡频率由你添加并打印，不是模板已有字段。
 
 ## 三、你需要把它做成什么样？
 
 ### 1. 等待：没启动就不主动运动
 
 `Waiting` 下输出为零。只有两轴反馈新鲜有效，并收到一次明确启动操作，才能进入 `Prepare`。
+
+**操作与检查：** 右上拨杆下位时，在 Tuning Studio 看 `state=Waiting`、两轴 `motor.command_voltage_raw=0`。分别轻转两轴，对应的 `motor.angle_rad` 和 `motor.speed_rpm` 应变化；停止转动后速度接近 0。只转 yaw 时 pitch 数据不应跟着跳动。先下拨再中拨且输入、反馈有效后，`state` 应进入 `Prepare`。
 
 ### 2. 回正：先回到约定的参考姿态
 
@@ -289,7 +316,9 @@ GM6020 提供单圈绝对角度反馈，原始机械角度范围为 `0～8191`�
 
 回正超时或出现异常，应退出并停止输出。
 
-遥控输入无效时，模板会清零指令并回到 `Waiting`。其余情况下发送阶段不再检查状态：`Waiting` 和 `Error` 下的零输出需要你在 `Control::update` 中调用 `disable_all` 实现。电机反馈有效性、回正限速限流及状态切换也由你实现。
+遥控输入无效时，模板会清零指令，非故障状态回到 `Waiting`，`Error` 则保留。其余情况下发送阶段不再检查状态：`Waiting` 和 `Error` 下的零输出需要你在 `Control::update` 中调用 `disable_all` 实现。电机反馈有效性、回正限速限输出及状态切换也由你实现。
+
+**操作与检查：** 两轴偏离参考姿态后 enable，看 `state` 从 Waiting 进入 Prepare。两个 `target_angle_rad` 应设为参考角度并保持固定，`motor.angle_rad` 向目标接近，`target_rpm` 与 `command_voltage_raw` 分别受位置环、速度环限幅约束。Prepare 中动摇杆不能改变角度目标。请打印自己实现的回正稳定计时；只有两轴误差、速度连续满足完成条件后，计时达到阈值，`state` 才变成 Running。
 
 ### 3. 调试：遥控器控制云台
 
@@ -299,18 +328,37 @@ GM6020 提供单圈绝对角度反馈，原始机械角度范围为 `0～8191`�
 
 重新调位置环时恢复合理的位置环 `maxout`，再从小增加位置环 Kp。修改前先 disable，重新初始化目标和 PID 历史；不要求在线修改参数。
 
+**操作与检查：** Running 中左右动左摇杆，`remote.channels[2]` 和 `yaw.target_angle_rad` 变化；上下动左摇杆，`remote.channels[3]` 和 `pitch.target_angle_rad` 变化，对应实际角度跟随。松手后通道回到死区，目标角度停在新值，不能回零。下拨后 `state=Waiting`，两轴输出为 0。
+
 ### 4. 故障：先停止，再让人处理
 
-自行实现至少两类判断：
+本次 `Error` 只要求两类检测：
 
-- 疑似卡住：输出较大、误差持续存在，但速度很低。
-- 持续剧烈振荡：误差反复变化，且幅度或速度持续较大。
+- **疑似堵转：** 有明显运动需求、输出较大，但实际速度持续很低。零目标速度下正常静止保持不能当作堵转。
+- **持续高频振荡：** 往返幅度超过小噪声，并且振荡频率持续超过你设定的阈值。一次超调或短暂符号变化不能当作超频振荡。
 
-上述是思路，不是直接可用的判据。你需要组合阈值、持续时间或窗口，避免把正常静止保持、一次超调和微小噪声误判为故障，并记录触发原因。
+阈值、计时或统计窗口由你实现，注明单位。频率要根据一段时间内的完整往返周期计算，不能把每次采样或每次符号变化直接当作一整个周期。检测在 `Prepare`、`Running` 中生效。
 
-触发后进入 `Error`，两轴发送零输出。用户处理问题或修改参数后，收到一次新的恢复操作，且反馈等基本条件正常，才可重新进入 `Running`。恢复时以当前角度初始化角度目标，速度目标归零，清理 PID 历史；持续不正常时不允许强行恢复。
+任一轴触发后，进入 `Error`，两轴输出清零，并打印触发轴与原因。问题消失或遥控器断开再接通，都不能自动恢复。无需扩展复杂的故障管理系统。
 
-反馈超时按模板要求回到 `Waiting`，重新获得反馈后仍需启动并回正。若修改参数导致重新烧录或重启，也重新走启动流程。软件故障恢复与看门狗复位后的板级锁定是两回事；后者按模板提示需要手动 RESET。
+**恢复操作由你选择一个明确的遥控动作。** 例如，Error 中右上拨杆保持中位，左上拨杆先下拨再上拨；识别一次新的操作，不能因为拨杆一直在上位就恢复。
+
+恢复时，两轴 `target_angle_rad` 设为各自当前的 `motor.angle_rad`，`target_rpm` 归零，清理 PID 历史和检测计数，直接回到 `Running`，从当前位置继续调试，不强制再次回正。问题仍存在时，检测应再次触发 Error。
+
+非故障时反馈超时仍按原要求停止并回到 `Waiting`；已进入 Error 时保留 Error。重新烧录或重启后按正常启动流程执行。看门狗复位后的板级锁定仍按模板提示手动 RESET。
+
+**操作与检查：**
+
+| 操作 | 观察位置 | 应看到的结果 |
+|---|---|---|
+| 用模拟输入先验证堵转判据，再由助教安排受控实机检查 | 目标速度、实际速度、输出和自己添加的堵转计时 | 条件持续时计时增长，达到阈值才进入 Error |
+| 用已知周期的往返数据验证振荡判据 | 自己统计并打印的频率 Hz、超频持续时间 | 频率估计与输入周期对应，持续超过阈值后进入 Error |
+| 任一故障触发 | `state`、两轴 `motor.command_voltage_raw`，RTT 原因日志 | Error，两轴输出同一轮清零，日志说明触发轴与原因 |
+| 不做恢复动作，或断开再接通遥控器 | `state`、两轴输出 | 仍为 Error，输出为 0 |
+| 摇杆回中，执行约定的恢复动作 | 切换处一次性 RTT 日志、两轴目标与反馈 | Error 变为 Running，切换时目标设为当前角度、速度目标与历史清零 |
+| 恢复后轻动摇杆 | 目标角度、实际角度 | 从当前位置继续跟随，不追赶故障前目标 |
+
+恢复切换的瞬间可能被低速曲线漏掉，因此在切换处打印当前角度、新目标及 reset 信息。恢复后的正常保持输出不保证为 0。实机检测由助教安排，不通过猛烈卡住电机或故意制造剧烈抖动来测试。
 
 ### 5. 哪些地方由你补全？
 
@@ -334,9 +382,21 @@ GM6020 提供单圈绝对角度反馈，原始机械角度范围为 `0～8191`�
 
 1. **先看反馈。** 先不使能电机，确认两轴对应正确，手动改变姿态时角度和速度方向符合说明。准备好停止操作。
 2. **确认闭环方向。** 在低输出限制下检查输出方向，确认负反馈后再逐渐调参。
-3. **单独调速度环。** 将位置环 `maxout` 设为 `0`，确认目标速度为零；速度环积分和微分先设为零，从小增加速度环 Kp。在允许施加轻微扰动的位置操作，感受抵抗转动的变化，记录速度和电流曲线。Kp 过大可能抖动。零速度环抵抗运动，但不保证回到原角度。
+3. **单独调速度环。** 将位置环 `maxout` 设为 `0`，确认目标速度为零；速度环积分和微分先设为零，从小增加速度环 Kp。在允许施加轻微扰动的位置操作，感受抵抗转动的变化，记录速度和电压输出曲线。Kp 过大可能抖动。零速度环抵抗运动，但不保证回到原角度。
 4. **再调位置环。** 保持稳定的速度环参数，恢复合理的位置环 `maxout`，从小增加位置环 Kp，给出小幅目标变化，观察跟踪快慢、超调，以及目标／实际速度。根据结果决定是否需要其他项，一次只改少量参数。
 5. **检查模式切换。** 验证启动回正、遥控、停止、故障和恢复，观察切换瞬间有没有突然运动。
+
+### 操作与检查补充
+
+| 调试项目 | 在 RTT 或 Tuning Studio 中看什么 | 应看到的结果 |
+|---|---|---|
+| 指令编码 | 在 `transmit` 中限频打印帧 ID 和 `data` | ID 是 `0x1FF`；零输出时八字节均为 0；未使用槽位始终为 0 |
+| PID 独立计算，不写入电机输出 | 临时打印 `calculate` 返回值 | Kp=2、Ki=Kd=0、目标10、反馈7、maxout=100 时返回6；maxout=5 时返回5；maxout=0 时返回0 |
+| 零速度环，位置环 maxout=0 | `yaw.target_rpm`、`yaw.motor.speed_rpm`、`yaw.motor.command_voltage_raw` | 目标速度始终为0；轻推时实际速度变化，输出抵抗转动；停止后速度接近0，不要求角度回到原位置 |
+| 位置双环跟踪 | 两轴目标／实际角度、目标／实际速度 | 目标角度改变后实际角度跟随，速度与输出受限；松手后目标保持 |
+| disable | `state`、两轴 `motor.command_voltage_raw` | 非故障时回Waiting，Error保持Error，两个输出均为0 |
+
+Ki 为0时积分贡献应为0，reset 后历史积分应清零。PID 参数字段由你添加，可在对应 `position_pid`、`speed_pid` 下查看。`data` 是局部变量，不保证在 Tuning Studio 中长期可见，编码检查用函数内限频日志；编码日志正确仍需结合运动反馈确认电机响应。不要每1ms打印一大段日志。100Hz曲线不能用于直接证明不存在高频振荡。
 
 ## 五、怎样实时看参数和曲线？
 
@@ -363,7 +423,7 @@ cargo run --release --locked
 
 本节按 Tuning Studio 0.1.3 编写，更早的版本界面不同。
 
-1. 命令面板执行 `Tuning Studio: Open Scope`，打开 Tuning Scope 面板。
+1. 命令面板执行 `Tuning Studio: Open Scope`，或者点击VScode左边插件栏的图标打开 Tuning Scope 面板。
 2. 点击面板左上角 **Open firmware…**，选择本次烧录对应的 `target/thumbv7em-none-eabihf/release/control-training-template`。这是不带扩展名的固件文件，不是 `.rs` 源码。不要选择旧编译结果。
 3. 点击右上角 **Connect…**，选择 SWD 调试探针和芯片 `STM32H723VGTx`。
 4. 左侧 Live Watch 中展开 **Tasks → control_task → control**，里面是 `Control` 的全部字段，例如 `yaw`、`pitch`、`state`。顶部输入框可按名称筛选。
