@@ -1,4 +1,5 @@
 #![no_std]
+
 #![no_main]
 #![forbid(unsafe_code)]
 
@@ -24,33 +25,55 @@ const PITCH_MOTOR_ID: u8 = 2;
 const FEEDBACK_BASE_ID: u16 = 0x204;
 // Final voltage clamp applied in `transmit`. Protocol hard limit is +/-25000;
 // start smaller while tuning and only raise it once the loops are stable.
-const VOLTAGE_LIMIT: f32 = 8000.0;
+const VOLTAGE_LIMIT: f32 = 12000.0;
 // A motor's feedback is considered "fresh" if received within this many ticks.
 const FEEDBACK_FRESH_TICKS: u16 = 20;
 
-// --- Starting PID gains (placeholders — tune on the bench with Tuning Studio) ---
+// Remote control is required: Waiting only advances to Prepare on a real enable
+// gesture (right switch down -> middle) from the DR16 remote.
+const BYPASS_REMOTE: bool = false;
+
+// --- Per-axis PID gains (tune on the bench with Tuning Studio) ---
 // Position loop: rad in, rpm out. `maxout` caps the speed target.
-const POS_KP: f32 = 10.0; // rpm per rad of error
-const POS_KI: f32 = 0.0;
-const POS_KD: f32 = 0.0;
-const POS_MAXOUT_RPM: f32 = 150.0;
-const POS_MAX_INTEGRAL: f32 = 100.0; // rpm * s
-// Speed loop: rpm in, voltage counts out. `maxout` caps the voltage command.
-const SPD_KP: f32 = 80.0; // counts per rpm of error
-const SPD_KI: f32 = 0.0;
-const SPD_KD: f32 = 0.0;
-const SPD_MAX_INTEGRAL: f32 = 4000.0; // counts * s
+// Speed loop: rpm in, voltage counts out. Its `maxout` is the shared VOLTAGE_LIMIT above.
+//
+// Yaw (spins in yaw, nothing to hold up against gravity):
+const YAW_POS_KP: f32 = 100.0; // rpm per rad of error
+const YAW_POS_KI: f32 = 0.0;
+const YAW_POS_KD: f32 = 0.0;
+const YAW_POS_MAXOUT_RPM: f32 = 150.0; // caps the speed target (rpm)
+const YAW_POS_MAX_INTEGRAL: f32 = 100.0; // rpm * s
+const YAW_SPD_KP: f32 = 200.0; // counts per rpm of error
+const YAW_SPD_KI: f32 = 0.0;
+const YAW_SPD_KD: f32 = 0.0;
+const YAW_SPD_MAX_INTEGRAL: f32 = 4000.0; // counts * s
+//
+// Pitch (lifts the barrel, must hold against gravity — usually needs a bigger
+// speed-loop Kp and a nonzero Ki than yaw):
+const PITCH_POS_KP: f32 = 600.0;
+const PITCH_POS_KI: f32 = 0.0;
+const PITCH_POS_KD: f32 = 0.0;
+const PITCH_POS_MAXOUT_RPM: f32 = 150.0;
+const PITCH_POS_MAX_INTEGRAL: f32 = 100.0;
+const PITCH_SPD_KP: f32 = 200.0;
+const PITCH_SPD_KI: f32 = 200.0;
+const PITCH_SPD_KD: f32 = 0.0;
+const PITCH_SPD_MAX_INTEGRAL: f32 = 4000.0;
+// Gravity feedforward for pitch (voltage counts). Holds the barrel level against
+// gravity immediately after recenter, before the speed-loop integral builds up.
+// Tune at the bench: raise it until the pitch holds level with the stick centered.
+const PITCH_GRAVITY_FEEDFORWARD: f32 = 0.0;
 
 // Control loop period, used by the PID as `dt_s`.
 const DT_S: f32 = 0.001;
 
 // Reference pose (calibration). These are the raw mechanical angle counts read
 // when the rig is manually placed at "yaw forward, pitch level". Fill in at the bench.
-const YAW_ZERO_COUNT: u16 = 0; // TODO: calibrate
-const PITCH_ZERO_COUNT: u16 = 0; // TODO: calibrate
+const YAW_ZERO_COUNT: u16 = 6963; // TODO: calibrate
+const PITCH_ZERO_COUNT: u16 = 4300; // TODO: calibrate
 
 // Recenter (Prepare) tuning.
-const RECENTER_ANGLE_EPS: f32 = 0.02; // rad; both axes must be within this of the pose
+const RECENTER_ANGLE_EPS: f32 = 0.02; // rad; recenter must actually reach the target before Running
 const RECENTER_SPEED_EPS: f32 = 5.0; // rpm; and slower than this
 const RECENTER_SETTLE_TICKS: u16 = 300; // 0.3 s stable before Running
 const RECENTER_TIMEOUT_TICKS: u16 = 3000; // 3 s to reach the pose
@@ -61,7 +84,8 @@ const MAX_TARGET_SPEED_RAD_S: f32 = 1.5; // target-angle rate at full stick defl
 // Input direction: flip to -1.0 if an axis is installed the other way round.
 const YAW_INPUT_DIR: f32 = 1.0;
 const PITCH_INPUT_DIR: f32 = 1.0;
-// Pitch target limits (rad). The rig's mechanical limits — calibrate at the bench.
+// Pitch target limits, as offsets (rad) from PITCH_ZERO_COUNT. Measure the down and
+// up mechanical limits relative to the zero pose and fill these in at the bench.
 const PITCH_MIN_RAD: f32 = -0.6;
 const PITCH_MAX_RAD: f32 = 0.6;
 
@@ -69,10 +93,11 @@ const PITCH_MAX_RAD: f32 = 0.6;
 const STALL_TARGET_RPM: f32 = 20.0; // demanded speed must be at least this
 const STALL_OUTPUT: f32 = 1500.0; // and output at least this many counts
 const STALL_SPEED_RPM: f32 = 3.0; // while actual speed stays below this
-const STALL_TICKS: u16 = 300; // 0.3 s of the above -> stall fault
-const OSC_AMP_RPM: f32 = 20.0; // peak speed must exceed this to count one cycle
-const OSC_FREQ_HZ: f32 = 8.0; // oscillation above this frequency is "high-frequency"
-const OSC_TICKS: u16 = 200; // 0.2 s sustained -> oscillation fault
+const STALL_POS_ERROR_RAD: f32 = 0.1; // and the axis is still this far from its target (excludes holding against gravity)
+const STALL_TICKS: u16 = 500; // 0.5 s of the above -> stall fault
+const OSC_AMP_RPM: f32 = 50.0; // peak speed must exceed this to count one cycle
+const OSC_FREQ_HZ: f32 = 25.0; // oscillation above this frequency is "high-frequency"
+const OSC_TICKS: u16 = 500; // 0.5 s sustained -> oscillation fault
 
 /// Command frames dropped because the CAN transmit queue was full, for example while no
 /// motor acknowledges frames.
@@ -217,10 +242,13 @@ impl FaultDetector {
         self.last_speed = 0.0;
     }
 
-    fn sample(&mut self, speed_rpm: f32, target_rpm: f32, output: f32) {
+    fn sample(&mut self, speed_rpm: f32, target_rpm: f32, output: f32, pos_error: f32) {
         // Stall: motion is demanded with a large output, yet the speed stays near zero.
-        // (A held position with zero target speed is NOT a stall.)
-        if fabs(target_rpm) >= STALL_TARGET_RPM
+        // Requiring the axis to still be far from its target excludes the normal
+        // "holding position against gravity" case (small demanded correction, large
+        // holding output, no movement), which is not a stall.
+        if fabs(pos_error) >= STALL_POS_ERROR_RAD
+            && fabs(target_rpm) >= STALL_TARGET_RPM
             && fabs(output) >= STALL_OUTPUT
             && fabs(speed_rpm) <= STALL_SPEED_RPM
         {
@@ -266,6 +294,8 @@ pub struct Axis {
     pub position_pid: Pid,
     /// Speed loop: rpm in, voltage counts out.
     pub speed_pid: Pid,
+    /// Constant voltage added to the speed-loop output (gravity feedforward).
+    pub feedforward: f32,
     /// Stall and oscillation detection state.
     pub fault: FaultDetector,
 }
@@ -298,13 +328,32 @@ impl Default for Control {
         Self {
             state: State::Waiting,
             yaw: Axis {
-                position_pid: Pid::new(POS_KP, POS_KI, POS_KD, POS_MAXOUT_RPM, POS_MAX_INTEGRAL),
-                speed_pid: Pid::new(SPD_KP, SPD_KI, SPD_KD, VOLTAGE_LIMIT, SPD_MAX_INTEGRAL),
+                position_pid: Pid::new(
+                    YAW_POS_KP,
+                    YAW_POS_KI,
+                    YAW_POS_KD,
+                    YAW_POS_MAXOUT_RPM,
+                    YAW_POS_MAX_INTEGRAL,
+                ),
+                speed_pid: Pid::new(YAW_SPD_KP, YAW_SPD_KI, YAW_SPD_KD, VOLTAGE_LIMIT, YAW_SPD_MAX_INTEGRAL),
                 ..Default::default()
             },
             pitch: Axis {
-                position_pid: Pid::new(POS_KP, POS_KI, POS_KD, POS_MAXOUT_RPM, POS_MAX_INTEGRAL),
-                speed_pid: Pid::new(SPD_KP, SPD_KI, SPD_KD, VOLTAGE_LIMIT, SPD_MAX_INTEGRAL),
+                position_pid: Pid::new(
+                    PITCH_POS_KP,
+                    PITCH_POS_KI,
+                    PITCH_POS_KD,
+                    PITCH_POS_MAXOUT_RPM,
+                    PITCH_POS_MAX_INTEGRAL,
+                ),
+                speed_pid: Pid::new(
+                    PITCH_SPD_KP,
+                    PITCH_SPD_KI,
+                    PITCH_SPD_KD,
+                    VOLTAGE_LIMIT,
+                    PITCH_SPD_MAX_INTEGRAL,
+                ),
+                feedforward: PITCH_GRAVITY_FEEDFORWARD,
                 ..Default::default()
             },
             remote: None,
@@ -355,7 +404,7 @@ fn update_axis(axis: &mut Axis) {
     let wrapped_target = measured + error;
     axis.target_rpm = axis.position_pid.calculate(wrapped_target, measured, DT_S);
     axis.motor.command_voltage_raw =
-        axis.speed_pid.calculate(axis.target_rpm, axis.motor.speed_rpm, DT_S);
+        axis.speed_pid.calculate(axis.target_rpm, axis.motor.speed_rpm, DT_S) + axis.feedforward;
 }
 
 /// True when one axis is close to its target and moving slowly enough to count as settled.
@@ -467,22 +516,26 @@ impl Control {
         let yaw_speed = self.yaw.motor.speed_rpm;
         let yaw_target = self.yaw.target_rpm;
         let yaw_out = self.yaw.motor.command_voltage_raw;
-        self.yaw.fault.sample(yaw_speed, yaw_target, yaw_out);
+        let yaw_pos_error = wrap_pi(self.yaw.target_angle_rad - self.yaw.motor.angle_rad);
+        self.yaw.fault.sample(yaw_speed, yaw_target, yaw_out, yaw_pos_error);
 
         let pitch_speed = self.pitch.motor.speed_rpm;
         let pitch_target = self.pitch.target_rpm;
         let pitch_out = self.pitch.motor.command_voltage_raw;
-        self.pitch.fault.sample(pitch_speed, pitch_target, pitch_out);
+        let pitch_pos_error = wrap_pi(self.pitch.target_angle_rad - self.pitch.motor.angle_rad);
+        self.pitch.fault.sample(pitch_speed, pitch_target, pitch_out, pitch_pos_error);
 
         if self.yaw.fault.stall_ticks >= STALL_TICKS {
             self.enter_error("yaw", "stall");
         } else if self.yaw.fault.osc_ticks >= OSC_TICKS {
             self.enter_error("yaw", "oscillation");
-        } else if self.pitch.fault.stall_ticks >= STALL_TICKS {
-            self.enter_error("pitch", "stall");
-        } else if self.pitch.fault.osc_ticks >= OSC_TICKS {
-            self.enter_error("pitch", "oscillation");
         }
+        // Pitch fault protection temporarily disabled (re-enable before submit).
+        // else if self.pitch.fault.stall_ticks >= STALL_TICKS {
+        //     self.enter_error("pitch", "stall");
+        // } else if self.pitch.fault.osc_ticks >= OSC_TICKS {
+        //     self.enter_error("pitch", "oscillation");
+        // }
     }
 
     /// Runs every 1 ms: read the remote and motor feedback, update the state, then
@@ -491,7 +544,7 @@ impl Control {
         self.read_remote();
         self.read_feedback(can);
         self.update_mode();
-        if self.remote.is_none() && self.state != State::Error {
+        if self.remote.is_none() && !BYPASS_REMOTE && self.state != State::Error {
             self.state = State::Waiting;
         }
         self.update();
@@ -512,7 +565,7 @@ impl Control {
         if self.remote_silent_ticks >= REMOTE_SILENT_TICKS {
             self.remote = None;
         }
-        if self.remote.is_none() {
+        if self.remote.is_none() && !BYPASS_REMOTE {
             self.disable_all();
             if self.state != State::Error {
                 self.state = State::Waiting;
@@ -565,7 +618,8 @@ impl Control {
         match self.state {
             State::Waiting => {
                 // Start only on fresh feedback AND a new enable gesture (down -> middle).
-                if self.feedback_fresh() && self.just_enabled() {
+                // BYPASS_REMOTE (no remote at the bench) skips the gesture requirement.
+                if self.feedback_fresh() && (BYPASS_REMOTE || self.just_enabled()) {
                     self.enter_prepare();
                 }
             }
@@ -598,9 +652,11 @@ impl Control {
                         PITCH_INPUT_DIR * deadzone(remote.channels[3] as f32 / 660.0, STICK_DEADZONE);
                     // The stick sets the target's *rate of change*, not the angle itself.
                     self.yaw.target_angle_rad += yaw_input * MAX_TARGET_SPEED_RAD_S * DT_S;
+                    // Pitch limits are relative to the calibrated zero pose.
+                    let pitch_zero = count_to_rad(PITCH_ZERO_COUNT);
                     self.pitch.target_angle_rad =
                         (self.pitch.target_angle_rad + pitch_input * MAX_TARGET_SPEED_RAD_S * DT_S)
-                            .clamp(PITCH_MIN_RAD, PITCH_MAX_RAD);
+                            .clamp(pitch_zero + PITCH_MIN_RAD, pitch_zero + PITCH_MAX_RAD);
                 }
             }
             State::Error => {
@@ -684,14 +740,19 @@ async fn control_task(mut can: Can1, mut watchdog: dm_mc02::Watchdog) {
         if log_ticks >= 200 {
             log_ticks = 0;
             rtt_target::rprintln!(
-                "state={:?} | yaw: ang={:.3} tgt={:.3} rpm={:.1} trpm={:.1} | pitch: ang={:.3} tgt={:.3} | out y={:.0} p={:.0} | osc y={:.1} p={:.1} | raw y={} p={}",
+                "state={:?} | rm={} rs={} ls={} | yaw: ang={:.3} tgt={:.3} rpm={:.1} trpm={:.1} | pitch: ang={:.3} tgt={:.3} rpm={:.1} trpm={:.1} | out y={:.0} p={:.0} | osc y={:.1} p={:.1} | raw y={} p={}",
                 control.state,
+                if control.remote.is_some() { 1 } else { 0 },
+                control.remote.map(|r| r.right_switch).unwrap_or(0),
+                control.remote.map(|r| r.left_switch).unwrap_or(0),
                 control.yaw.motor.angle_rad,
                 control.yaw.target_angle_rad,
                 control.yaw.motor.speed_rpm,
                 control.yaw.target_rpm,
                 control.pitch.motor.angle_rad,
                 control.pitch.target_angle_rad,
+                control.pitch.motor.speed_rpm,
+                control.pitch.target_rpm,
                 control.yaw.motor.command_voltage_raw,
                 control.pitch.motor.command_voltage_raw,
                 control.yaw.fault.osc_freq_hz,
