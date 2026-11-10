@@ -529,13 +529,11 @@ impl Control {
             self.enter_error("yaw", "stall");
         } else if self.yaw.fault.osc_ticks >= OSC_TICKS {
             self.enter_error("yaw", "oscillation");
+        } else if self.pitch.fault.stall_ticks >= STALL_TICKS {
+            self.enter_error("pitch", "stall");
+        } else if self.pitch.fault.osc_ticks >= OSC_TICKS {
+            self.enter_error("pitch", "oscillation");
         }
-        // Pitch fault protection temporarily disabled (re-enable before submit).
-        // else if self.pitch.fault.stall_ticks >= STALL_TICKS {
-        //     self.enter_error("pitch", "stall");
-        // } else if self.pitch.fault.osc_ticks >= OSC_TICKS {
-        //     self.enter_error("pitch", "oscillation");
-        // }
     }
 
     /// Runs every 1 ms: read the remote and motor feedback, update the state, then
